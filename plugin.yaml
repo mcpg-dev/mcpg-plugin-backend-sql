@@ -1,0 +1,13 @@
+schema: mcpg.dev/plugin/v1
+id: dev.mcpg.backend.sql
+name: SQL Binding
+license: Apache-2.0
+description: |
+  Dispatches tool calls as parameterised SQL statements against a
+  configured database pool. Supports PostgreSQL, MySQL, and SQLite
+  drivers. Accompanied by two watch strategies in this same crate:
+  plugin.watch_polling.yaml and plugin.watch_pg_listen.yaml.
+class: backend
+runtime: native-cdylib-v1
+protocol_version: "1.0"
+required_capabilities: [network_outbound]

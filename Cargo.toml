@@ -1,0 +1,107 @@
+[package]
+name = "mcpg-plugin-backend-sql"
+version = "0.1.0-alpha.15"
+license = "Apache-2.0"
+edition = "2024"
+description = "SQL database binding plugin for mcpg (Postgres, MySQL/MariaDB, SQLite)"
+
+[lib]
+# cdylib: the .so the gateway's native_loader dlopens. rlib: in-tree
+# unit tests + the static `new()` / `set_host_handle` constructors used
+# by the gateway boot path and tests.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default  = ["postgres", "mysql", "sqlite"]
+postgres = ["sqlx/postgres"]
+mysql    = ["sqlx/mysql"]
+sqlite   = ["sqlx/sqlite", "dep:libsqlite3-sys"]
+
+# Default OFF so the workspace rlib build does not emit
+# `mcpg_plugin_register` and collide with the other plugin rlibs.
+# Standalone cdylib builds (nx docker:build / OCI publish) opt in via
+# `--features cdylib-export`.
+cdylib-export = []
+# Declared empty so the SDK macro's `register_static` accessor
+# (`#[cfg(feature = "static-firstparty")]`) does not trip
+# `unexpected_cfgs`. sql is consumed as a cdylib.
+static-firstparty = []
+
+# ─────────────────────────────────────────────────────────────────
+# Cloud-DB token auth providers. Each scheme is its own
+# Cargo feature so flagship `mcpg-plugin-backend-sql` builds with no
+# AWS/Azure/GCP transitive deps. Operator YAML carrying an `auth:`
+# block whose `kind` points at a feature-disabled scheme fails at
+# `register_profile` with a clear "feature not compiled in" error
+# (the stub's `NotImplemented` path), so misconfiguration is caught
+# at boot, not on first request.
+# ─────────────────────────────────────────────────────────────────
+sql-rds-iam = ["dep:aws-config", "dep:aws-credential-types", "dep:aws-sigv4"]
+sql-azure-ad = []
+sql-gcp-iam = []
+sql-aurora-failover = []
+
+[dependencies]
+mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+# Unified HostHandle surface (span / metric / audit /
+# resolve_secret / config_snapshot). The plugin stores a
+# `HostHandle` on `Self` and routes per-call observability through
+# it ALONGSIDE the existing internal `tracing::span!` / `metrics::*`
+# calls; the coexistence is intentional.
+mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13", features = ["static-firstparty"] }
+mcpg-plugin-host = { git = "https://github.com/mcpg-dev/mcpg-plugin-host", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+mcpg-sensitive = { git = "https://github.com/mcpg-dev/mcpg-sensitive", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+anyhow         = "1"
+async-trait    = "0.1"
+base64         = "0.22"
+cel            = "0.13"
+blake3         = "1"
+bytes          = "1"
+hex            = "0.4"
+hmac-sha256    = "1.1"
+chrono         = { version = "0.4", features = ["clock", "serde"] }
+dashmap        = "6"
+# `futures-util::TryStreamExt::try_next` for draining sqlx's
+# `fetch_many` stream in the multi-result-set MySQL path.
+futures-util   = "0.3"
+# Pulled transitively by `sqlx/sqlite`; declared explicitly so we can
+# call `sqlite3_interrupt` from `cancel_backend`. Version pinned
+# to whatever sqlx-sqlite resolves to in Cargo.lock — stay aligned to
+# avoid duplicate sqlite3 symbol versions in the final binary.
+# `bundled` compiles SQLite from vendored C (no system libsqlite3 link)
+# — required for musl/static builds (Alpine/scratch have no libsqlite3),
+# and feature-unifies graph-wide so sqlx-sqlite uses the same bundled
+# SQLite (one symbol set, glibc + musl alike).
+libsqlite3-sys = { version = "0.30", default-features = false, features = ["bundled"], optional = true }
+metrics        = "0.24"
+parking_lot    = "0.12"
+rust_decimal   = { version = "1", features = ["db-postgres"] }
+serde          = { version = "1", features = ["derive"] }
+serde_json     = "1"
+sqlx           = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "any", "uuid", "chrono", "json", "rust_decimal"] }
+thiserror      = "2"
+tokio          = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
+tokio-util     = "0.7"
+tracing        = "0.1"
+url            = "2"
+uuid           = { version = "1", features = ["v4", "serde"] }
+
+# Cloud-auth optional deps. All three are already present
+# in the workspace via `mcpg-plugin-storage-s3` (s3-content-store
+# feature on the gateway), so enabling `sql-rds-iam` adds no fresh
+# transitive bloat — only re-uses the already-resolved versions.
+# `default-features = false` + `default-https-client` keeps the AWS SDK on
+# the modern aws-lc-rs / rustls 0.23 HTTPS client and off the EOL rustls 0.21
+# + rustls-webpki 0.101 stack (the SDK's `rustls` feature is the LEGACY path;
+# see the matching note in `libs/plugins/storage/s3/Cargo.toml`). Must match
+# the s3 plugin's feature selection so workspace feature-unification doesn't
+# re-pull the legacy connector.
+aws-config            = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "credentials-process", "sso"], optional = true }
+aws-credential-types  = { version = "1", optional = true }
+aws-sigv4             = { version = "1", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+tempfile  = "3"
+tokio     = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+
