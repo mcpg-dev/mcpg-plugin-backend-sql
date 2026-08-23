@@ -1,6 +1,6 @@
 [package]
 name = "mcpg-plugin-backend-sql"
-version = "0.1.0-alpha.16"
+version = "0.1.0-alpha.17"
 license = "Apache-2.0"
 edition = "2024"
 description = "SQL database binding plugin for mcpg (Postgres, MySQL/MariaDB, SQLite)"
@@ -42,15 +42,15 @@ sql-gcp-iam = []
 sql-aurora-failover = []
 
 [dependencies]
-mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14" }
+mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.15", version = "=0.1.0-beta.15" }
 # Unified HostHandle surface (span / metric / audit /
 # resolve_secret / config_snapshot). The plugin stores a
 # `HostHandle` on `Self` and routes per-call observability through
 # it ALONGSIDE the existing internal `tracing::span!` / `metrics::*`
 # calls; the coexistence is intentional.
-mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14", features = ["static-firstparty"] }
-mcpg-plugin-host = { git = "https://github.com/mcpg-dev/mcpg-plugin-host", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14" }
-mcpg-sensitive = { git = "https://github.com/mcpg-dev/mcpg-sensitive", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14" }
+mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-beta.15", version = "=0.1.0-beta.15", features = ["static-firstparty"] }
+mcpg-plugin-host = { git = "https://github.com/mcpg-dev/mcpg-plugin-host", tag = "v0.1.0-beta.16", version = "=0.1.0-beta.16" }
+mcpg-sensitive = { git = "https://github.com/mcpg-dev/mcpg-sensitive", tag = "v0.1.0-beta.15", version = "=0.1.0-beta.15" }
 anyhow         = "1"
 async-trait    = "0.1"
 base64         = "0.22"
