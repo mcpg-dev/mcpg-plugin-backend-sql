@@ -1,6 +1,6 @@
 [package]
 name = "mcpg-plugin-backend-sql"
-version = "0.1.0-alpha.19"
+version = "0.1.0-alpha.20"
 license = "Apache-2.0"
 edition = "2024"
 description = "SQL database binding plugin for mcpg (Postgres, MySQL/MariaDB, SQLite)"

@@ -2273,8 +2273,12 @@ impl SqlBackendPlugin {
         // value under the same name — operator derivations are
         // not spoofable by clients.
         if !runtime.param_exprs.is_empty() {
-            param_exprs::evaluate_into(&mut args_value, runtime.param_exprs.as_slice())
-                .map_err(BackendError::from)?;
+            param_exprs::evaluate_into(
+                &mut args_value,
+                runtime.param_exprs.as_slice(),
+                request.identity.as_ref(),
+            )
+            .map_err(BackendError::from)?;
         }
 
         // Stream-cursor decoding. When the binding is in
@@ -2764,8 +2768,12 @@ impl SqlBackendPlugin {
             })?
         };
         if !runtime.param_exprs.is_empty() {
-            param_exprs::evaluate_into(&mut args_value, runtime.param_exprs.as_slice())
-                .map_err(BackendError::from)?;
+            param_exprs::evaluate_into(
+                &mut args_value,
+                runtime.param_exprs.as_slice(),
+                request.identity.as_ref(),
+            )
+            .map_err(BackendError::from)?;
         }
 
         // Fire the trigger once — its result is discarded; the
