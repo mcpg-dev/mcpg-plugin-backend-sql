@@ -98,6 +98,13 @@ pub struct SqlBackendConfig {
     /// Pool sizing and timeouts.
     #[serde(default)]
     pub pool: PoolConfig,
+    /// Injected unconditionally by the host's dynamic-registration path
+    /// (`gateway.server.allow_private_backends`). Accepted so the strict
+    /// spec does not refuse the host contract, and deliberately unused:
+    /// databases legitimately live on private addresses, so the SSRF
+    /// egress toggle does not gate SQL connections.
+    #[serde(default)]
+    pub allow_private_backends: bool,
     /// The query/procedure this binding invokes. A query block is
     /// required; pure-wait configurations are not yet supported.
     pub query: QueryShape,
@@ -1372,6 +1379,7 @@ mod tests {
             driver,
             url: url.into(),
             pool: PoolConfig::default(),
+            allow_private_backends: false,
             query: QueryShape {
                 body: QueryBody::Sql {
                     sql: "SELECT 1".into(),

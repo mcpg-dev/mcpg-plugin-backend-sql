@@ -1850,6 +1850,7 @@ impl BackendPlugin for SqlBackendPlugin {
                         resource: Some(format!("sql-binding://{backend_name}")),
                         outcome: AuditOutcome::Failure,
                         request_id: Some(request_id.clone()),
+                        upstream_request_id: None,
                         node_id: None,
                         details: serde_json::json!({
                             "backend": backend_name,
