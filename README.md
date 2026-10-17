@@ -8,13 +8,14 @@ steps via the standard `BackendPlugin` contract plus SQL-specific
 surfaces. Reach for it to query a database directly instead of
 wrapping it behind a REST service.
 
-One cdylib ships three entities under `dev.mcpg.backend.sql`:
+One cdylib ships four entities under `dev.mcpg.backend.sql`:
 
 | `backend.kind` | Entity manifest id | Surface |
 |---|---|---|
 | `sql` | `dev.mcpg.backend.sql` | tool / resource / pipeline-step dispatch |
 | `sql_polling` | `dev.mcpg.watch.sql_polling` | interval-hash resource watch strategy |
 | `postgres_listen_notify` | `dev.mcpg.watch.postgres_listen_notify` | Postgres `LISTEN`/`NOTIFY` watch strategy |
+| `sql_changes` | `dev.mcpg.watch.sql_changes` | each inserted, updated or deleted row a keyset query reads, as an MCP Events source that resumes |
 
 ## Configuration
 
@@ -55,9 +56,14 @@ Additional capabilities shipped beyond the MVP:
   `PROCESS` / `CONNECTION_ADMIN` privilege on the pool user —
   probed at registration via `SHOW GRANTS FOR CURRENT_USER`; opt out
   with `pool.require_cancel_privilege: false`).
-- **Watch strategies** — `sql_polling` (interval hash) and
-  `postgres_listen_notify` (push via `LISTEN`/`NOTIFY`) as pluggable
-  `WatchStrategyPlugin`s.
+- **Watch strategies** — `sql_polling` (interval hash),
+  `postgres_listen_notify` (push via `LISTEN`/`NOTIFY`) and `sql_changes`
+  (a keyset query over an id, a change marker or a trigger outbox; one
+  `sql.row.changed` event per row with `op` `insert`, `update` or
+  `delete`; resumes after the last stored key) as pluggable
+  `WatchStrategyPlugin`s; and `postgres_cdc`, every change a
+  PostgreSQL publication carries, from a logical replication slot (see
+  [PostgreSQL change data capture](#postgresql-change-data-capture-postgres_cdc)).
 - **Schema-drift retry** — automatic one-shot retry on Postgres
   SQLSTATEs `26000`/`42P18`/`0A000` and MySQL `1615 ER_NEED_REPREPARE`
   when a cached prepared statement goes stale after concurrent DDL.
@@ -222,6 +228,65 @@ admin backend gated behind `governance.minimum_trust = "verified"`
 (`--`, `/* */`) are stripped before the check so hiding
 `-- innocent\nGRANT …` doesn't bypass it.
 
+## PostgreSQL change data capture (`postgres_cdc`)
+
+The `postgres_cdc` watch strategy reads every change a publication carries
+from a logical replication slot. It decodes the built-in `pgoutput` plugin
+through the SQL slot functions (`pg_logical_slot_peek_binary_changes`), so it
+needs no extension and no replication connection, and works on managed
+PostgreSQL (RDS, Aurora, Cloud SQL, Azure, Supabase, Neon).
+
+```yaml
+mcp:
+  capabilities:
+    events:
+      - name: orders.changed
+        description: A row of the orders table was inserted, updated or deleted.
+        source:
+          watch:
+            strategy:
+              type: plugin
+              kind: postgres_cdc
+              url: "postgres://mcpg_cdc:${env.PG_CDC_PASSWORD}@db.internal/shop?sslmode=require"
+              publication: mcpg_orders
+              tables: [public.orders]
+            event_type: sql.row.changed
+```
+
+| Field | Default | Notes |
+|---|---|---|
+| `url` | — | `postgres://`, with its password and `sslmode`; resolved before the watch starts and never logged. |
+| `publication` | — | The publication whose tables are read. |
+| `tables` | `[]` | Create the publication `FOR TABLE` these when it is missing; without them a missing publication is an error. |
+| `slot` | derived from the source | The replication slot, created when missing. |
+| `poll_interval_ms` | `1000` | How often the slot is read when it had nothing new (100 to 20000). |
+| `max_in_flight`, `ack_timeout_ms` | `256`, `60000` | Changes out at a time, and how long one waits for the gateway before it is read again. |
+
+Each insert, update or delete is a `sql.row.changed` event: `op`, `schema`,
+`table`, `row` (the row after the change; for a delete the old key, or the
+old row under `REPLICA IDENTITY FULL`), `old` (an update's old row, when the
+replica identity sends it), `unchanged` (TOASTed columns the change did not
+send), `lsn`, `xid` and `commitTime`. Integers, floats, booleans and
+`json`/`jsonb` are JSON values; `numeric` and other types are PostgreSQL's
+text. A `TRUNCATE` is `sql.table.truncated`.
+
+Delivery is at-least-once, in commit order: the slot advances
+(`pg_replication_slot_advance`) only once the gateway has stored every change
+of a transaction and of every transaction before it, and a change it did not
+take is read again under the same `slot/lsn` event id.
+
+Requirements and care:
+
+- `wal_level = logical` on the server, and a role with replication rights
+  (`REPLICATION`, `rds_replication`, `cloudsqlsuperuser`, …) that may create
+  the slot and, with `tables`, the publication.
+- A slot keeps WAL on the server until it advances. Drop the slot of a
+  source you remove (`SELECT pg_drop_replication_slot('…')`), and consider
+  `max_slot_wal_keep_size` as a guard.
+- A slot that is gone when the source restarts (dropped, or lost in a
+  failover) is created again, and the event log records a gap: what changed
+  in between is not known.
+
 ## Environment expectations
 
 Integration tests look for the following (Linux only):
@@ -229,9 +294,20 @@ Integration tests look for the following (Linux only):
 - `POSTGRES_TEST_URL` — e.g. `postgres://mcpg:mcpg@localhost/mcpg_test`
 - `MYSQL_TEST_URL` — e.g. `mysql://mcpg:mcpg@127.0.0.1/mcpg_test`
 
-Both are set automatically by the `.github/workflows/sql-integration.yml`
-lane on every SQL PR. Tests without the env vars short-circuit with a
-note; they don't fail. SQLite tests always run (in-memory).
+Both are set by the `SQL / postgres` and `SQL / mysql` rows of
+`.github/workflows/integration.yml`, which also set `MCPG_REQUIRE_DB=1` and
+run postgres with `wal_level = logical`. Without the env vars a test skips
+with a note, unless `MCPG_REQUIRE_DB` is set, which makes the skip a failure.
+SQLite tests always run (in-memory). The `cdc_postgres` suite also needs
+`wal_level = logical`, and skips on a server without it unless
+`MCPG_REQUIRE_DB` is set:
+
+```bash
+docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=mcpg postgres:16-alpine \
+  postgres -c wal_level=logical
+POSTGRES_TEST_URL=postgres://postgres:mcpg@127.0.0.1:5432/postgres \
+  cargo test -p mcpg-plugin-backend-sql --test cdc_postgres
+```
 
 ## Benches
 

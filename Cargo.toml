@@ -1,6 +1,6 @@
 [package]
 name = "mcpg-plugin-backend-sql"
-version = "0.1.0-alpha.43"
+version = "0.1.0-alpha.44"
 license = "Apache-2.0"
 edition = "2024"
 description = "SQL database binding plugin for mcpg (Postgres, MySQL/MariaDB, SQLite)"
@@ -42,15 +42,15 @@ sql-gcp-iam = []
 sql-aurora-failover = []
 
 [dependencies]
-mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.39", version = "=0.1.0-beta.39" }
+mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.40", version = "=0.1.0-beta.40" }
 # Unified HostHandle surface (span / metric / audit /
 # resolve_secret / config_snapshot). The plugin stores a
 # `HostHandle` on `Self` and routes per-call observability through
 # it ALONGSIDE the existing internal `tracing::span!` / `metrics::*`
 # calls; the coexistence is intentional.
-mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-beta.40", version = "=0.1.0-beta.40", features = ["static-firstparty"] }
-mcpg-plugin-host = { git = "https://github.com/mcpg-dev/mcpg-plugin-host", tag = "v0.1.0-beta.41", version = "=0.1.0-beta.41" }
-mcpg-sensitive = { git = "https://github.com/mcpg-dev/mcpg-sensitive", tag = "v0.1.0-beta.38", version = "=0.1.0-beta.38" }
+mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-beta.41", version = "=0.1.0-beta.41", features = ["static-firstparty"] }
+mcpg-plugin-host = { git = "https://github.com/mcpg-dev/mcpg-plugin-host", tag = "v0.1.0-beta.42", version = "=0.1.0-beta.42" }
+mcpg-sensitive = { git = "https://github.com/mcpg-dev/mcpg-sensitive", tag = "v0.1.0-beta.39", version = "=0.1.0-beta.39" }
 anyhow         = "1"
 async-trait    = "0.1"
 base64         = "0.23"
@@ -79,6 +79,10 @@ rust_decimal   = { version = "1", features = ["db-postgres"] }
 serde          = { version = "1", features = ["derive"] }
 serde_json     = "1"
 sqlx           = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "any", "uuid", "chrono", "json", "rust_decimal"] }
+# The crypto provider the plugin installs: a build that links both rustls
+# providers has none by default, and sqlx verifies a `verify-ca` server
+# with a verifier built from the default.
+rustls         = { version = "0.23", default-features = false, features = ["ring", "std"] }
 thiserror      = "2"
 tokio          = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
 tokio-util     = "0.7"

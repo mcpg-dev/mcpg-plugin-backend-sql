@@ -227,6 +227,7 @@ impl WatchStrategyPlugin for PostgresListenNotifyWatchPlugin {
             let cancel_child = cancel.clone();
             let uri_owned = resource_uri.to_owned();
             let channel_owned = parsed.channel.clone();
+            let event_source = mcpg_plugin_protocol::is_event_source(resource_uri);
 
             tokio::spawn(async move {
                 loop {
@@ -239,7 +240,11 @@ impl WatchStrategyPlugin for PostgresListenNotifyWatchPlugin {
                         recv_res = listener.recv() => {
                             match recv_res {
                                 Ok(notif) => {
-                                    let event = event_from_payload(notif.payload());
+                                    let event = event_from_payload(
+                                        notif.channel(),
+                                        notif.payload(),
+                                        event_source,
+                                    );
                                     sink.emit(event).await;
                                 }
                                 Err(e) => {
@@ -268,30 +273,39 @@ impl WatchStrategyPlugin for PostgresListenNotifyWatchPlugin {
     }
 }
 
-/// Build a `WatchEvent` from the NOTIFY payload. If the payload
-/// parses as a JSON object with a string `user_id` / `session_id`,
-/// those fields propagate to the event so subject-scoped filters
-/// can fan out selectively. Everything else → generic broadcast.
-fn event_from_payload(payload: &str) -> WatchEvent {
-    if payload.is_empty() {
-        return WatchEvent::default();
-    }
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(payload) else {
-        return WatchEvent::default();
-    };
-    let Some(obj) = parsed.as_object() else {
-        return WatchEvent::default();
-    };
-    WatchEvent {
-        user_id: obj
-            .get("user_id")
+/// The MCP Events type every NOTIFY is emitted as.
+pub const NOTIFICATION_EVENT_TYPE: &str = "postgres.notification";
+
+/// Build a `WatchEvent` from a NOTIFY on `channel`. If the payload is a
+/// JSON object with a string `user_id` / `session_id`, those propagate so
+/// subject-scoped resource filters can fan out selectively. For an MCP
+/// Events source (`event_source`) the event also carries
+/// `{channel, payload, payloadEncoding}` as its data: the payload's JSON
+/// when it is JSON, else its text. A resource watch wants only the change.
+fn event_from_payload(channel: &str, payload: &str, event_source: bool) -> WatchEvent {
+    let parsed = serde_json::from_str::<serde_json::Value>(payload).ok();
+    let field = |name: &str| {
+        parsed
+            .as_ref()
+            .and_then(|v| v.get(name))
             .and_then(|v| v.as_str())
-            .map(str::to_owned),
-        session_id: obj
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned),
+            .map(str::to_owned)
+    };
+    let mut event = WatchEvent {
+        user_id: field("user_id"),
+        session_id: field("session_id"),
+        ..WatchEvent::default()
+    };
+    if event_source {
+        let (body, encoding) = mcpg_plugin_protocol::event_body(payload.as_bytes());
+        event.event_type = Some(NOTIFICATION_EVENT_TYPE.to_owned());
+        event.data = Some(serde_json::json!({
+            "channel": channel,
+            "payload": body,
+            "payloadEncoding": encoding,
+        }));
     }
+    event
 }
 
 #[cfg(test)]
@@ -347,21 +361,25 @@ mod tests {
 
     #[test]
     fn event_from_payload_empty_is_default() {
-        let e = event_from_payload("");
+        let e = event_from_payload("orders", "", true);
         assert!(e.user_id.is_none());
         assert!(e.session_id.is_none());
+        assert_eq!(
+            e.data,
+            Some(json!({ "channel": "orders", "payload": "", "payloadEncoding": "text" }))
+        );
     }
 
     #[test]
     fn event_from_payload_extracts_user_id() {
-        let e = event_from_payload(r#"{"user_id": "u-42", "data": {}}"#);
+        let e = event_from_payload("orders", r#"{"user_id": "u-42", "data": {}}"#, false);
         assert_eq!(e.user_id.as_deref(), Some("u-42"));
         assert!(e.session_id.is_none());
     }
 
     #[test]
     fn event_from_payload_extracts_session_id() {
-        let e = event_from_payload(r#"{"session_id": "sess-abc"}"#);
+        let e = event_from_payload("orders", r#"{"session_id": "sess-abc"}"#, false);
         assert_eq!(e.session_id.as_deref(), Some("sess-abc"));
     }
 
@@ -369,7 +387,36 @@ mod tests {
     fn event_from_payload_ignores_unparseable_payload() {
         // Trigger authors sometimes use `NOTIFY channel, 'free text'`
         // — not JSON. Plugin should still emit a broadcast event.
-        let e = event_from_payload("row 42 changed");
+        let e = event_from_payload("orders", "row 42 changed", true);
         assert!(e.user_id.is_none());
+        assert_eq!(
+            e.data,
+            Some(json!({
+                "channel": "orders", "payload": "row 42 changed", "payloadEncoding": "text"
+            }))
+        );
+    }
+
+    #[test]
+    fn a_notification_is_an_mcp_events_occurrence_with_its_json_payload() {
+        let e = event_from_payload("orders", r#"{"id": 7, "total": 12}"#, true);
+        assert_eq!(e.event_type.as_deref(), Some(NOTIFICATION_EVENT_TYPE));
+        assert_eq!(
+            e.data,
+            Some(json!({
+                "channel": "orders",
+                "payload": { "id": 7, "total": 12 },
+                "payloadEncoding": "json",
+            }))
+        );
+    }
+
+    /// A resource watch wants only the change; the payload is an event
+    /// source's alone.
+    #[test]
+    fn a_resource_watch_gets_no_payload() {
+        let e = event_from_payload("orders", r#"{"id": 7, "user_id": "u-1"}"#, false);
+        assert_eq!(e.user_id.as_deref(), Some("u-1"));
+        assert!(e.event_type.is_none() && e.data.is_none());
     }
 }

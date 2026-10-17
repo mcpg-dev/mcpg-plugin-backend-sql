@@ -36,6 +36,8 @@ pub mod in_flight;
 pub(crate) mod metrics;
 pub mod param_exprs;
 pub mod params;
+#[cfg(feature = "postgres")]
+mod pgoutput;
 pub mod pool;
 pub mod redact;
 pub mod schema;
@@ -43,6 +45,9 @@ pub mod session;
 pub mod stream;
 pub mod transaction;
 pub mod watch;
+pub mod watch_changes;
+#[cfg(feature = "postgres")]
+pub mod watch_pg_cdc;
 #[cfg(feature = "postgres")]
 pub mod watch_pg_listen;
 

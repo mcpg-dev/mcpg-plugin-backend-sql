@@ -13,8 +13,8 @@
 //! pilots (`libs/plugins/backend/{nats,kafka}`). Deviations, all
 //! intentional:
 //!
-//! - Three entities: one `backend` (kind `sql`) + two `watch_strategy`
-//!   (kinds `sql_polling` + `postgres_listen_notify`). The backend
+//! - Four entities: one `backend` (kind `sql`) + three `watch_strategy`
+//!   (kinds `sql_polling`, `postgres_listen_notify`, `sql_changes`). The backend
 //!   overrides `execute_transaction` + `audit_metadata` (v35/v36) on top
 //!   of the standard surface.
 //! - The backend factory installs the host handle on the inner plugin
@@ -41,6 +41,7 @@ use mcpg_plugin_sdk::{HostHandle, HostHandleBackendHost};
 
 use crate::SqlBackendPlugin;
 use crate::watch::SqlPollingWatchPlugin;
+use crate::watch_changes::SqlChangesWatchPlugin;
 use crate::watch_pg_listen::PostgresListenNotifyWatchPlugin;
 
 /// Build the private multi-thread runtime each cdylib wrapper uses to
@@ -53,6 +54,17 @@ fn build_bridge_runtime(thread_name: &str) -> tokio::runtime::Runtime {
         .enable_all()
         .build()
         .unwrap_or_else(|e| panic!("sql cdylib: tokio runtime init failed: {e}"))
+}
+
+/// Install the crypto provider rustls builds TLS configurations from: a
+/// build that links both rustls providers has no default, sqlx verifies a
+/// `verify-ca` server from it, and this cdylib's copy of rustls does not see
+/// the host's.
+pub(crate) fn install_crypto_provider() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -74,6 +86,7 @@ impl SqlBackendCdylib {
     /// observability AND wrapped into an `Arc<dyn BackendHost>` passed to
     /// `register_profile`.
     pub fn from_host_config(_config_json: &str, host: HostHandle) -> Self {
+        install_crypto_provider();
         let inner = SqlBackendPlugin::new();
         let _installed = inner.set_host_handle(host.clone());
         Self {
@@ -204,6 +217,7 @@ impl SqlPollingWatchCdylib {
     /// polling watcher carries no plugin-level config (per-watch
     /// connection + query arrive via the `watch` spec).
     pub fn from_host_config(_config_json: &str, _host: HostHandle) -> Self {
+        install_crypto_provider();
         Self {
             inner: SqlPollingWatchPlugin::new(),
             rt: build_bridge_runtime("mcpg-watch-sql-polling"),
@@ -212,6 +226,62 @@ impl SqlPollingWatchCdylib {
 }
 
 impl SyncWatchStrategyPlugin for SqlPollingWatchCdylib {
+    fn manifest(&self) -> &PluginManifest {
+        WatchStrategyPlugin::manifest(&self.inner)
+    }
+    fn kind(&self) -> &str {
+        WatchStrategyPlugin::kind(&self.inner)
+    }
+    fn watch(
+        &self,
+        resource_uri: &str,
+        spec: &serde_json::Value,
+        emit_event: Box<dyn Fn(&str) + Send + Sync + 'static>,
+    ) -> Result<WatchHandleBox, WatchError> {
+        let sink = Arc::new(ClosureWatchSink { emit: emit_event });
+        let handle = self.rt.block_on(WatchStrategyPlugin::watch(
+            &self.inner,
+            resource_uri,
+            spec,
+            sink,
+        ))?;
+        let state = Box::new(WatchCancelState {
+            handle,
+            rt: self.rt.handle().clone(),
+        });
+        Ok(WatchHandleBox(Box::into_raw(state) as *mut ()))
+    }
+    fn cancel(&self, watch_handle: WatchHandleBox) {
+        if watch_handle.0.is_null() {
+            return;
+        }
+        // SAFETY: pointer produced by `Box::into_raw` in `watch`, round-
+        // tripped by the host exactly once.
+        #[allow(unsafe_code)]
+        let state = unsafe { Box::from_raw(watch_handle.0 as *mut WatchCancelState) };
+        state.rt.block_on(state.handle.cancel());
+    }
+}
+
+/// `SyncWatchStrategyPlugin` bridge over [`SqlChangesWatchPlugin`].
+pub struct SqlChangesWatchCdylib {
+    inner: SqlChangesWatchPlugin,
+    rt: tokio::runtime::Runtime,
+}
+
+impl SqlChangesWatchCdylib {
+    /// Infallible cdylib factory. The watch carries no plugin-level
+    /// config: the connection, query and key arrive in the `watch` spec.
+    pub fn from_host_config(_config_json: &str, _host: HostHandle) -> Self {
+        install_crypto_provider();
+        Self {
+            inner: SqlChangesWatchPlugin::new(),
+            rt: build_bridge_runtime("mcpg-watch-sql-changes"),
+        }
+    }
+}
+
+impl SyncWatchStrategyPlugin for SqlChangesWatchCdylib {
     fn manifest(&self) -> &PluginManifest {
         WatchStrategyPlugin::manifest(&self.inner)
     }
@@ -260,6 +330,7 @@ impl PgListenWatchCdylib {
     /// LISTEN/NOTIFY watcher carries no plugin-level config (per-watch
     /// connection + channel arrive via the `watch` spec).
     pub fn from_host_config(_config_json: &str, _host: HostHandle) -> Self {
+        install_crypto_provider();
         Self {
             inner: PostgresListenNotifyWatchPlugin::new(),
             rt: build_bridge_runtime("mcpg-watch-pg-listen"),
@@ -306,10 +377,11 @@ impl SyncWatchStrategyPlugin for PgListenWatchCdylib {
 }
 
 // ---------------------------------------------------------------------------
-// cdylib export — three entities under `dev.mcpg.backend.sql`. Each watch
+// cdylib export — four entities under `dev.mcpg.backend.sql`. Each watch
 // entity self-describes via its `manifest()` slot (ids
-// `dev.mcpg.watch.sql_polling` / `dev.mcpg.watch.postgres_listen_notify`)
-// and is distinguished by its `inner_name` slug.
+// `dev.mcpg.watch.sql_polling` / `dev.mcpg.watch.postgres_listen_notify` /
+// `dev.mcpg.watch.sql_changes`) and is distinguished by its `inner_name`
+// slug.
 // ---------------------------------------------------------------------------
 mcpg_plugin_sdk::declare_plugin! {
     plugin_id: "dev.mcpg.backend.sql",
@@ -344,6 +416,18 @@ mcpg_plugin_sdk::declare_plugin! {
             plugin_type: PgListenWatchCdylib,
             factory: |cfg, host: ::mcpg_plugin_sdk::HostHandle|
                 PgListenWatchCdylib::from_host_config(cfg, host),
+        },
+        watch_strategy as watch_changes {
+            inner_name: "watch-changes",
+            plugin_type: SqlChangesWatchCdylib,
+            factory: |cfg, host: ::mcpg_plugin_sdk::HostHandle|
+                SqlChangesWatchCdylib::from_host_config(cfg, host),
+        },
+        watch_strategy as watch_pg_cdc {
+            inner_name: "watch-pg-cdc",
+            plugin_type: crate::watch_pg_cdc::PostgresCdcWatchCdylib,
+            factory: |cfg, host: ::mcpg_plugin_sdk::HostHandle|
+                crate::watch_pg_cdc::PostgresCdcWatchCdylib::from_host_config(cfg, host),
         },
     ],
 }
