@@ -262,11 +262,12 @@ impl PostgresCdc {
         // The changes in flight come first again, each with its BEGIN and
         // COMMIT, so a peek of `in_flight + max` rows can end before any new
         // change: read further until it holds `max` of them or the output
-        // ends.
+        // ends. Only an output shorter than the limit is the end; one that
+        // reaches it can stop at a COMMIT exactly there.
         let mut limit = (in_flight + max).clamp(1, MAX_PEEK_ROWS);
         let messages = loop {
             let messages = self.peek_rows(pool, limit).await?;
-            if messages.len() <= limit
+            if messages.len() < limit
                 || limit == MAX_PEEK_ROWS
                 || self.new_changes(&messages) >= max
             {
