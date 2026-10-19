@@ -10,13 +10,11 @@
 //! - **Observability** — `mcpg_sql_requests_in_flight` gauge tracks
 //!   how many queries the plugin is actively running. Operator admin
 //!   tooling can snapshot the table for age / slow-query surfacing.
-//! - **Cancellation** — when MCP cancel delivery lands,
-//!   each entry will carry a driver-level backend identifier
-//!   (Postgres PID / MySQL connection ID / SQLite handle) so a side
-//!   channel can send `pg_cancel_backend` / `KILL QUERY` /
-//!   `sqlite3_interrupt`. That field is wired up here but populated
-//!   lazily — first implementation lands with the cancel driver hooks
-//!   themselves in the next phase.
+//! - **Cancellation** — an entry carries a driver-level backend
+//!   identifier (Postgres PID / MySQL connection ID / SQLite query
+//!   handle) once the driver has one, so a side channel can send
+//!   `pg_cancel_backend` / `KILL QUERY`, or set the SQLite query's
+//!   cancel flag.
 //!
 //! # RAII contract
 //!

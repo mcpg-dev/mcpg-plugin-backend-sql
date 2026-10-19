@@ -8,27 +8,25 @@
 //! # Cancel
 //!
 //! SQLite has no server-side backend identifier and no side-channel
-//! cancel. The runtime cancel path uses the FFI `sqlite3_interrupt`
-//! call, which is one of the few SQLite C APIs that is documented as
-//! safe to invoke from a different thread than the one currently
-//! running the query. The driver:
+//! cancel. Each query that takes an `ExecCtx` gets a cancel flag of
+//! its own, and a progress handler on its pinned connection that ends
+//! the running statement with `SQLITE_INTERRUPT` once the flag is set:
 //!
-//! 1. On `execute_with_ctx`, captures the raw `*mut sqlite3` handle
-//!    from sqlx's `LockedSqliteHandle::as_raw_handle()`, stores it
-//!    (as `usize` for `Send`-ability) in a per-driver side-table
-//!    keyed by a fresh `u64` nonce, and registers the nonce on the
-//!    in-flight registry as `BackendId::Sqlite { handle }`.
-//! 2. The query runs on the same pinned connection that owned the
-//!    handle. The pointer is valid for that connection's lifetime.
-//! 3. `cancel_backend` looks up the nonce, loads the atomic ptr, and
-//!    calls `libsqlite3_sys::sqlite3_interrupt` if non-null.
-//! 4. On any exit path (success or error) the executing future
-//!    zeroes the atomic ptr and drops the table entry — concurrent
-//!    cancels racing the cleanup harmlessly observe a null pointer.
+//! 1. `execute_with_ctx` pins a connection, installs the handler, and
+//!    registers the flag in a per-driver table under a fresh `u64`
+//!    nonce, which the in-flight registry records as
+//!    `BackendId::Sqlite { handle }`.
+//! 2. `cancel_backend` sets the flag. SQLite checks the handler where
+//!    it checks for `sqlite3_interrupt`, so a running statement ends
+//!    as promptly; unlike `sqlite3_interrupt`, which SQLite clears
+//!    when a statement starts, a flag set before the statement starts
+//!    still ends it.
+//! 3. When the query ends, its flag goes inactive and leaves the table,
+//!    so a handler left on the pooled connection stops no later query.
 
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -43,17 +41,52 @@ use crate::in_flight::BackendId;
 use crate::params::{BoundParam, PreparedStmt};
 use crate::session::SessionVars;
 
-/// SQLite driver. Holds the in-flight handle table that
-/// `cancel_backend` consults to issue `sqlite3_interrupt` against the
-/// matching connection.
+/// How many SQLite VM instructions run between two checks of a query's
+/// cancel flag.
+const CANCEL_CHECK_OPS: i32 = 1_000;
+
+/// SQLite driver. Holds the table of running queries that
+/// `cancel_backend` consults to cancel one.
 pub struct SqliteDriver {
-    /// Nonce → atomic raw `*mut sqlite3` (as `usize`). Insert on
-    /// query start, zero + remove on query exit. `cancel_backend`
-    /// loads-and-checks-non-null under no extra lock.
-    handles: Arc<DashMap<u64, Arc<AtomicUsize>>>,
+    /// Nonce → the cancel flag of a running query; in the table from
+    /// when the query is registered until it ends.
+    handles: Arc<DashMap<u64, Arc<Cancel>>>,
     /// Monotonically increasing handle id source. Wraps; collisions
     /// over `u64` are not a real risk.
     next_handle: AtomicU64,
+}
+
+/// One query's cancel state, read by the progress handler on its
+/// connection.
+#[derive(Debug)]
+struct Cancel {
+    cancelled: AtomicBool,
+    /// Cleared when the query ends: the handler stays on the pooled
+    /// connection when the query's future is dropped, and must then stop
+    /// nothing.
+    active: AtomicBool,
+}
+
+impl Cancel {
+    /// Whether the statement running on the connection is to end now.
+    fn stops(&self) -> bool {
+        self.active.load(Ordering::Acquire) && self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+/// A query in the cancel table; it leaves the table, and its flag goes
+/// inactive, when this drops, on every exit path of the query.
+struct Running<'a> {
+    handles: &'a DashMap<u64, Arc<Cancel>>,
+    nonce: u64,
+    cancel: Arc<Cancel>,
+}
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.cancel.active.store(false, Ordering::Release);
+        self.handles.remove(&self.nonce);
+    }
 }
 
 impl Default for SqliteDriver {
@@ -71,22 +104,37 @@ impl SqliteDriver {
         }
     }
 
-    /// Register a connection's raw sqlite3 pointer in the cancel
-    /// table. Returns `(nonce, slot)` — the slot is held by the
-    /// caller and zeroed on query exit so a racing cancel sees null.
-    fn register_handle(&self, raw_ptr: usize) -> (u64, Arc<AtomicUsize>) {
+    /// Install a cancel flag's progress handler on `conn` and register
+    /// the flag in the cancel table.
+    async fn start(
+        &self,
+        conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    ) -> Result<Running<'_>, SqlError> {
+        let cancel = Arc::new(Cancel {
+            cancelled: AtomicBool::new(false),
+            active: AtomicBool::new(true),
+        });
+        let watched = Arc::clone(&cancel);
+        conn.lock_handle()
+            .await
+            .map_err(SqlError::from_execute)?
+            .set_progress_handler(CANCEL_CHECK_OPS, move || !watched.stops());
         let nonce = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        let slot = Arc::new(AtomicUsize::new(raw_ptr));
-        self.handles.insert(nonce, Arc::clone(&slot));
-        (nonce, slot)
+        self.handles.insert(nonce, Arc::clone(&cancel));
+        Ok(Running {
+            handles: &self.handles,
+            nonce,
+            cancel,
+        })
     }
+}
 
-    /// Drop the handle entry. The slot is zeroed first so any racing
-    /// cancel that loaded the Arc but hasn't checked yet sees a null
-    /// pointer rather than dereferencing a stale handle.
-    fn release_handle(&self, nonce: u64, slot: &Arc<AtomicUsize>) {
-        slot.store(0, Ordering::Release);
-        self.handles.remove(&nonce);
+/// Take an ended query out of the cancel table and its handler off the
+/// connection. A handler this cannot remove is inactive already.
+async fn finish(conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>, running: Running<'_>) {
+    drop(running);
+    if let Ok(mut handle) = conn.lock_handle().await {
+        handle.remove_progress_handler();
     }
 }
 
@@ -169,20 +217,21 @@ impl SqlDriver for SqliteDriver {
                 ));
             }
         };
-        // Pin one connection; the captured raw pointer is valid for
-        // its lifetime. Without pinning, a parallel cancel might
-        // target the wrong connection.
+        // Pin one connection: the progress handler that honours the
+        // cancel is on this connection, and the query must run there.
         let mut conn = pool.acquire().await.map_err(SqlError::from_execute)?;
-        let raw_ptr = capture_raw_handle(&mut conn).await?;
-        let (nonce, slot) = self.register_handle(raw_ptr);
+        let running = self.start(&mut conn).await?;
         if let (Some(registry), Some(rid)) = (ctx.in_flight, ctx.request_id) {
-            registry.set_backend_id(rid, BackendId::Sqlite { handle: nonce });
+            registry.set_backend_id(
+                rid,
+                BackendId::Sqlite {
+                    handle: running.nonce,
+                },
+            );
         }
 
-        // Run on the pinned connection. A concurrent
-        // `cancel_backend` call can fire from another task here and
-        // raise SQLITE_INTERRUPT, which sqlx surfaces as an error
-        // we map through `from_execute`.
+        // A cancel ends the statement with SQLITE_INTERRUPT, which
+        // sqlx surfaces as an error mapped through `from_execute`.
         let mut q = sqlx::query(&stmt.sql);
         for arg in args {
             q = bind_sqlite(q, &arg.value);
@@ -191,10 +240,7 @@ impl SqlDriver for SqliteDriver {
             .fetch_all(&mut *conn)
             .await
             .map_err(SqlError::from_execute);
-
-        // Always clear the slot before returning — even on Err — so
-        // a stale cancel never reaches a freed handle.
-        self.release_handle(nonce, &slot);
+        finish(&mut conn, running).await;
         finish_rows(rows_result?)
     }
 
@@ -240,10 +286,14 @@ impl SqlDriver for SqliteDriver {
             }
         };
         let mut conn = pool.acquire().await.map_err(SqlError::from_execute)?;
-        let raw_ptr = capture_raw_handle(&mut conn).await?;
-        let (nonce, slot) = self.register_handle(raw_ptr);
+        let running = self.start(&mut conn).await?;
         if let (Some(registry), Some(rid)) = (ctx.in_flight, ctx.request_id) {
-            registry.set_backend_id(rid, BackendId::Sqlite { handle: nonce });
+            registry.set_backend_id(
+                rid,
+                BackendId::Sqlite {
+                    handle: running.nonce,
+                },
+            );
         }
 
         let mut q = sqlx::query(&stmt.sql);
@@ -251,7 +301,7 @@ impl SqlDriver for SqliteDriver {
             q = bind_sqlite(q, &arg.value);
         }
         let result = q.execute(&mut *conn).await.map_err(SqlError::from_execute);
-        self.release_handle(nonce, &slot);
+        finish(&mut conn, running).await;
         Ok(result?.rows_affected())
     }
 
@@ -268,29 +318,9 @@ impl SqlDriver for SqliteDriver {
                 )));
             }
         };
-        // Look up the slot. Cloning the Arc out releases the dashmap
-        // shard lock immediately so the cleanup path can proceed.
-        let Some(slot) = self.handles.get(&nonce).map(|e| e.value().clone()) else {
-            // Already cleaned up — the query finished between when
-            // the caller observed the BackendId and when we got
-            // here. No-op is the correct response.
-            return Ok(());
-        };
-        let raw = slot.load(Ordering::Acquire);
-        if raw == 0 {
-            // Cleanup beat us to it (zeroed by `release_handle`).
-            return Ok(());
-        }
-        // SAFETY: `sqlite3_interrupt` is documented as one of the
-        // few SQLite C APIs safe to call from any thread regardless
-        // of which thread holds the connection's lock. The pointer
-        // remains valid as long as the slot's atomic content is
-        // non-zero — `release_handle` zeros it before dropping the
-        // map entry, so any non-zero load means the pinned
-        // connection is still live.
-        #[allow(unsafe_code)]
-        unsafe {
-            libsqlite3_sys::sqlite3_interrupt(raw as *mut libsqlite3_sys::sqlite3);
+        // A query no longer in the table has ended: nothing to cancel.
+        if let Some(cancel) = self.handles.get(&nonce).map(|e| Arc::clone(e.value())) {
+            cancel.cancelled.store(true, Ordering::Release);
         }
         Ok(())
     }
@@ -311,18 +341,6 @@ impl SqlDriver for SqliteDriver {
             .map(|_| ())
             .map_err(SqlError::from_execute)
     }
-}
-
-/// Lock the connection long enough to read its raw `sqlite3*`
-/// pointer, then release the lock. The raw pointer remains valid as
-/// long as the connection is alive — sqlx does not invalidate it on
-/// ordinary use, only on connection drop.
-async fn capture_raw_handle(
-    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
-) -> Result<usize, SqlError> {
-    let mut handle = conn.lock_handle().await.map_err(SqlError::from_execute)?;
-    let raw = handle.as_raw_handle().as_ptr() as usize;
-    Ok(raw)
 }
 
 /// Drain a successful row fetch into the driver's `RowBatch` shape.
@@ -479,11 +497,60 @@ mod tests {
         (driver, outcome.pool)
     }
 
-    /// Recursive CTE that counts to 1B. SQLite's vdbe loop checks
-    /// `sqlite3_interrupt` between steps so the cancel raises a
+    /// Recursive CTE that counts to 1B. SQLite's vdbe loop calls the
+    /// progress handler between steps, so a cancel raises a
     /// SQLITE_INTERRUPT error promptly.
     const SLOW_QUERY: &str = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 1000000000) \
          SELECT count(*) FROM n";
+
+    fn sqlite_pool(pool: &PoolHandle) -> &sqlx::SqlitePool {
+        match pool {
+            PoolHandle::Sqlite(p) => p,
+            #[allow(unreachable_patterns)]
+            _ => unreachable!("an sqlite pool"),
+        }
+    }
+
+    /// A cancel after the query is registered and before its statement
+    /// starts still ends the statement: `sqlite3_interrupt` would be
+    /// cleared when the statement starts, the query's flag is not. The
+    /// handler it leaves on the connection, once the query has ended,
+    /// stops no later statement there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancel_before_the_statement_starts_still_ends_it() {
+        let (driver, pool) = pool_for("early").await;
+        let mut conn = sqlite_pool(&pool).acquire().await.expect("acquire");
+        let running = driver.start(&mut conn).await.expect("start");
+        driver
+            .cancel_backend(
+                &pool,
+                BackendId::Sqlite {
+                    handle: running.nonce,
+                },
+            )
+            .await
+            .expect("cancel");
+
+        let res = tokio::time::timeout(
+            Duration::from_secs(30),
+            sqlx::query(SLOW_QUERY).fetch_all(&mut *conn),
+        )
+        .await
+        .expect("the cancelled statement ends instead of counting on");
+        let Err(err) = res else {
+            panic!("the cancelled statement returned rows");
+        };
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("interrupt"), "got: {msg}");
+
+        drop(running);
+        assert!(driver.handles.is_empty(), "an ended query leaves the table");
+        let one: i64 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("a later statement on the connection runs");
+        assert_eq!(one, 1);
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancel_interrupts_running_query() {

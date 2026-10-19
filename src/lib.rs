@@ -16,13 +16,9 @@
 //! object. The response payload is the JSON-encoded result of the
 //! query, shaped per `row_mode`.
 
-// SQLite cancel requires one `unsafe` FFI call to
-// `libsqlite3_sys::sqlite3_interrupt` — that one call is documented
-// as thread-safe and is the only way to interrupt an in-flight
-// SQLite query without a server-side side-channel. Outside the
-// sqlite feature we still forbid unsafe code globally.
-#![cfg_attr(not(feature = "sqlite"), forbid(unsafe_code))]
-#![cfg_attr(feature = "sqlite", deny(unsafe_code))]
+// Denied rather than forbidden: the cdylib's watch handles turn an FFI
+// pointer back into its box, and allow it where they do.
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod auth;

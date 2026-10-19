@@ -297,7 +297,7 @@ pub trait SqlDriver: Send + Sync {
     /// `backend_id` is what the registry stored for
     /// the request; the driver decodes the variant and issues the
     /// engine-appropriate cancel (`pg_cancel_backend`, `KILL QUERY`,
-    /// `sqlite3_interrupt`). Default impl returns `InvalidSpec`
+    /// the SQLite query's cancel flag). Default impl returns `InvalidSpec`
     /// so drivers without a cancel story fail explicitly.
     async fn cancel_backend(
         &self,
