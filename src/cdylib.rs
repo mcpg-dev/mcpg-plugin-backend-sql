@@ -431,3 +431,28 @@ mcpg_plugin_sdk::declare_plugin! {
         },
     ],
 }
+
+#[cfg(test)]
+mod tests {
+    /// The descriptor compiled into the cdylib passes the checks the host's
+    /// native loader runs on it; one it refuses keeps the whole plugin out.
+    #[test]
+    fn the_compiled_in_descriptor_is_one_the_host_loads() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("plugin.yaml");
+        std::fs::write(&path, super::DESCRIPTOR_YAML).expect("write descriptor");
+        let descriptor = mcpg_plugin_host::load_descriptor(&path).expect("descriptor loads");
+        for kind in ["sql_changes", "postgres_cdc"] {
+            let strategy = descriptor
+                .watch_strategy(kind)
+                .unwrap_or_else(|| panic!("`{kind}` is declared"));
+            assert!(
+                strategy
+                    .event_types
+                    .iter()
+                    .any(|t| t.name == "sql.row.changed"),
+                "`{kind}` emits sql.row.changed"
+            );
+        }
+    }
+}
