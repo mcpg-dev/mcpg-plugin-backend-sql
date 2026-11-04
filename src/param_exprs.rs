@@ -21,6 +21,9 @@
 //!   (`subject_id` null), so a fence like
 //!   `author: "identity.subject_id"` binds NULL rather than a value a
 //!   caller chose — the argument map can never supply these fields.
+//! - `client` — the MCP client that sent the call, as it named itself:
+//!   `name` and `version` (strings or null). Self-reported and never
+//!   verified: record it (`via: "client.name"`), do not fence on it.
 //!
 //! # Collision policy
 //!
@@ -81,10 +84,24 @@ pub fn evaluate_into(
     exprs: &[ParamExpr],
     identity: Option<&PluginIdentity>,
 ) -> Result<(), SqlError> {
+    evaluate_with_client(args, exprs, identity, None)
+}
+
+/// [`evaluate_into`], with `client` bound as the MCP client of the call.
+pub fn evaluate_with_client(
+    args: &mut Value,
+    exprs: &[ParamExpr],
+    identity: Option<&PluginIdentity>,
+    client: Option<&mcpg_plugin_protocol::ClientInfo>,
+) -> Result<(), SqlError> {
     if exprs.is_empty() {
         return Ok(());
     }
     let identity_cel = json_to_cel(&identity_json(identity));
+    let client_cel = json_to_cel(&serde_json::json!({
+        "name": client.map(|c| c.name.clone()),
+        "version": client.and_then(|c| c.version.clone()),
+    }));
     // Normalize `args` to an object for key-based injection. `null`
     // (no args supplied) becomes `{}`.
     if matches!(args, Value::Null) {
@@ -113,6 +130,10 @@ pub fn evaluate_into(
         ctx.add_variable("identity", identity_cel.clone())
             .map_err(|e| {
                 SqlError::InvalidSpec(format!("param_exprs['{}']: bind identity: {e}", expr.name))
+            })?;
+        ctx.add_variable("client", client_cel.clone())
+            .map_err(|e| {
+                SqlError::InvalidSpec(format!("param_exprs['{}']: bind client: {e}", expr.name))
             })?;
         let out = expr.program.execute(&ctx).map_err(|e| {
             SqlError::InvalidSpec(format!(
@@ -374,6 +395,26 @@ mod tests {
         let id = verified("agent-7");
         evaluate_into(&mut args, &exprs, Some(&id)).unwrap();
         assert_eq!(args["author"], "agent-7");
+    }
+
+    #[test]
+    fn the_client_of_the_call_is_bound_and_null_without_one() {
+        let exprs = compile_all(
+            &[("via".to_string(), "client.name".to_string())]
+                .into_iter()
+                .collect(),
+        )
+        .unwrap();
+        let client = mcpg_plugin_protocol::ClientInfo {
+            name: "claude-code".into(),
+            version: Some("2.1".into()),
+        };
+        let mut args = serde_json::json!({"via": "spoofed"});
+        evaluate_with_client(&mut args, &exprs, None, Some(&client)).unwrap();
+        assert_eq!(args["via"], "claude-code");
+        let mut args = serde_json::json!({"via": "spoofed"});
+        evaluate_into(&mut args, &exprs, None).unwrap();
+        assert_eq!(args["via"], serde_json::Value::Null);
     }
 
     #[test]

@@ -228,6 +228,38 @@ admin backend gated behind `governance.minimum_trust = "verified"`
 (`--`, `/* */`) are stripped before the check so hiding
 `-- innocent\nGRANT …` doesn't bypass it.
 
+## PostgreSQL LISTEN/NOTIFY watch (`postgres_listen_notify`)
+
+A resource watch that `LISTEN`s on a channel. Every watch on the same
+`url` and `channel` shares one connection, open while one of them runs.
+
+Without `uri_match`, every NOTIFY on the channel updates every resource
+watching it. With `uri_match`, a NOTIFY updates a resource only when one of
+the `uris` patterns, with `{value}` replaced by the payload's
+`payload_field`, is that resource's URI. A payload that is not JSON or
+lacks the field updates nothing.
+
+```yaml
+watch:
+  strategy:
+    type: plugin
+    kind: postgres_listen_notify
+    url: "postgres://app:${env.DB_PW}@db/app"
+    channel: imd_refs
+    uri_match:
+      payload_field: i                       # NOTIFY imd_refs, '{"i":"abc",...}'
+      uris: ["imd://instructions/{value}"]   # updates imd://instructions/abc only
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `url` | string (required) | Connection URL. |
+| `channel` | string (required) | ASCII letters, digits and `_`. |
+| `uri_match.payload_field` | string | A top-level string or number field of the JSON payload. |
+| `uri_match.uris` | string[] | URI patterns, each with `{value}`; exact match. |
+
+A watch that falls more than 1024 notifications behind reports one change.
+
 ## PostgreSQL change data capture (`postgres_cdc`)
 
 The `postgres_cdc` watch strategy reads every change a publication carries

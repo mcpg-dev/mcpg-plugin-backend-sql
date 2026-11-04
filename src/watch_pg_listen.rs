@@ -26,20 +26,25 @@
 //!
 //! # Connection lifecycle
 //!
-//! Each watcher holds one dedicated connection for the lifetime of
-//! the subscription — `pg_notify` only delivers to sessions that
-//! `LISTEN`ed before the NOTIFY fired, and connection pooling would
-//! lose events between checkouts. The underlying sqlx `PgListener`
-//! re-connects transparently on disconnection and re-issues `LISTEN`
-//! for the subscribed channel.
+//! Every watch on the same `(url, channel)` shares one dedicated
+//! connection, held while at least one of them runs — `pg_notify` only
+//! delivers to sessions that `LISTEN`ed before the NOTIFY fired, and
+//! connection pooling would lose events between checkouts. The
+//! underlying sqlx `PgListener` re-connects transparently on
+//! disconnection and re-issues `LISTEN` for the subscribed channel.
 //!
 //! # Payload handling
+//!
+//! Without `uri_match`, every NOTIFY on the channel is a change of
+//! every watched URI. With `uri_match`, a NOTIFY is a change of a
+//! watched URI only when one of the `uris` patterns, with `{value}`
+//! replaced by the payload's `payload_field`, is that URI; a payload
+//! without the field changes nothing.
 //!
 //! The NOTIFY payload is forwarded in the [`WatchEvent`]'s `user_id`
 //! field if it parses as a small JSON object with a `user_id` key —
 //! this lets subject-scoped notification filters fan out only to the
-//! owning subscriber. Any other payload shape results in a generic
-//! broadcast event.
+//! owning subscriber.
 //!
 //! # Transactional visibility
 //!
@@ -97,10 +102,54 @@ pub struct PostgresListenNotifyWatchSpec {
     /// Channel to LISTEN on. Quoted at the driver layer so
     /// case-sensitive names work.
     pub channel: String,
+    /// Which watched URI a NOTIFY changes. Absent: every one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri_match: Option<UriMatch>,
+}
+
+/// Maps a NOTIFY payload to the URIs it changes.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct UriMatch {
+    /// A top-level field of the JSON payload (string or number).
+    pub payload_field: String,
+    /// URI patterns; `{value}` is the payload field's value. A NOTIFY
+    /// changes a watched URI equal to one of them.
+    pub uris: Vec<String>,
+}
+
+impl UriMatch {
+    /// Whether `payload` names `uri`.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    fn matches(&self, payload: &str, uri: &str) -> bool {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+            return false;
+        };
+        let value = match value.get(&self.payload_field) {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Number(n)) => n.to_string(),
+            _ => return false,
+        };
+        self.uris
+            .iter()
+            .any(|pattern| pattern.replace("{value}", &value) == uri)
+    }
 }
 
 impl PostgresListenNotifyWatchSpec {
     fn validate(&self) -> Result<(), SqlError> {
+        if let Some(m) = &self.uri_match {
+            if m.payload_field.trim().is_empty() {
+                return Err(SqlError::InvalidSpec(
+                    "watch.uri_match.payload_field must not be empty".into(),
+                ));
+            }
+            if m.uris.is_empty() || m.uris.iter().any(|u| !u.contains("{value}")) {
+                return Err(SqlError::InvalidSpec(
+                    "watch.uri_match.uris must be non-empty, each with `{value}`".into(),
+                ));
+            }
+        }
         if self.url.trim().is_empty() {
             return Err(SqlError::InvalidSpec("watch.url must not be empty".into()));
         }
@@ -129,6 +178,104 @@ impl PostgresListenNotifyWatchSpec {
 /// `WatchStrategyPlugin` for `kind: "postgres_listen_notify"`.
 pub struct PostgresListenNotifyWatchPlugin {
     manifest: PluginManifest,
+    #[cfg(feature = "postgres")]
+    listeners: Arc<std::sync::Mutex<ListenerMap>>,
+}
+
+/// One NOTIFY: `(channel, payload)`.
+#[cfg(feature = "postgres")]
+type Notification = (String, String);
+
+/// The open LISTEN connections, by `(url, channel)`. A connection lives
+/// while a watch holds its [`SharedListener`].
+#[cfg(feature = "postgres")]
+type ListenerMap = std::collections::HashMap<(String, String), std::sync::Weak<SharedListener>>;
+
+/// One LISTEN connection, fanned out to every watch on it.
+#[cfg(feature = "postgres")]
+struct SharedListener {
+    notifications: tokio::sync::broadcast::Sender<Notification>,
+    cancel: CancellationToken,
+}
+
+#[cfg(feature = "postgres")]
+impl Drop for SharedListener {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+/// Notifications buffered per watch before a slow one lags.
+#[cfg(feature = "postgres")]
+const NOTIFICATION_BUFFER: usize = 1024;
+
+#[cfg(feature = "postgres")]
+impl PostgresListenNotifyWatchPlugin {
+    /// The shared connection for `(url, channel)`, opened when none runs.
+    async fn listener(&self, url: &str, channel: &str) -> Result<Arc<SharedListener>, WatchError> {
+        let key = (url.to_owned(), channel.to_owned());
+        if let Some(shared) = self
+            .listeners
+            .lock()
+            .expect("listener map")
+            .get(&key)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return Ok(shared);
+        }
+        let mut listener = sqlx::postgres::PgListener::connect(url)
+            .await
+            .map_err(|e| WatchError::Subscribe {
+                message: format!("open LISTEN connection: {e}"),
+            })?;
+        listener
+            .listen(channel)
+            .await
+            .map_err(|e| WatchError::Subscribe {
+                message: format!("LISTEN {channel}: {e}"),
+            })?;
+        let (notifications, _) = tokio::sync::broadcast::channel(NOTIFICATION_BUFFER);
+        let cancel = CancellationToken::new();
+        let shared = Arc::new(SharedListener {
+            notifications: notifications.clone(),
+            cancel: cancel.clone(),
+        });
+        let mut map = self.listeners.lock().expect("listener map");
+        // Another watch opened one meanwhile: use it, and close ours.
+        if let Some(existing) = map.get(&key).and_then(std::sync::Weak::upgrade) {
+            return Ok(existing);
+        }
+        map.retain(|_, weak| weak.strong_count() > 0);
+        map.insert(key, Arc::downgrade(&shared));
+        drop(map);
+        let channel_owned = channel.to_owned();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return,
+                    recv_res = listener.recv() => match recv_res {
+                        Ok(notif) => {
+                            let _ = notifications
+                                .send((notif.channel().to_owned(), notif.payload().to_owned()));
+                        }
+                        Err(e) => {
+                            // PgListener reconnects transparently; a `recv`
+                            // error usually means the pool is closing.
+                            warn!(
+                                channel = %channel_owned,
+                                error = %e,
+                                "postgres_listen_notify: recv error; awaiting cancel"
+                            );
+                            cancel.cancelled().await;
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        Ok(shared)
+    }
 }
 
 impl std::fmt::Debug for PostgresListenNotifyWatchPlugin {
@@ -154,6 +301,8 @@ impl PostgresListenNotifyWatchPlugin {
                 name: "Postgres LISTEN/NOTIFY Watch",
                 class: WatchStrategy,
             },
+            #[cfg(feature = "postgres")]
+            listeners: Arc::default(),
         }
     }
 }
@@ -206,20 +355,12 @@ impl WatchStrategyPlugin for PostgresListenNotifyWatchPlugin {
 
         #[cfg(feature = "postgres")]
         {
-            let mut listener = sqlx::postgres::PgListener::connect(&parsed.url)
-                .await
-                .map_err(|e| WatchError::Subscribe {
-                    message: format!("open LISTEN connection: {e}"),
-                })?;
-            listener
-                .listen(&parsed.channel)
-                .await
-                .map_err(|e| WatchError::Subscribe {
-                    message: format!("LISTEN {}: {e}", parsed.channel),
-                })?;
+            let shared = self.listener(&parsed.url, &parsed.channel).await?;
+            let mut notifications = shared.notifications.subscribe();
             info!(
                 uri = %resource_uri,
                 channel = %parsed.channel,
+                uri_match = parsed.uri_match.is_some(),
                 "postgres_listen_notify: subscribed"
             );
 
@@ -227,9 +368,12 @@ impl WatchStrategyPlugin for PostgresListenNotifyWatchPlugin {
             let cancel_child = cancel.clone();
             let uri_owned = resource_uri.to_owned();
             let channel_owned = parsed.channel.clone();
+            let uri_match = parsed.uri_match.clone();
             let event_source = mcpg_plugin_protocol::is_event_source(resource_uri);
 
             tokio::spawn(async move {
+                // Holds the shared connection open while this watch runs.
+                let _shared = shared;
                 loop {
                     tokio::select! {
                         biased;
@@ -237,31 +381,31 @@ impl WatchStrategyPlugin for PostgresListenNotifyWatchPlugin {
                             debug!(uri = %uri_owned, "postgres_listen_notify: cancelled");
                             return;
                         }
-                        recv_res = listener.recv() => {
-                            match recv_res {
-                                Ok(notif) => {
-                                    let event = event_from_payload(
-                                        notif.channel(),
-                                        notif.payload(),
-                                        event_source,
-                                    );
-                                    sink.emit(event).await;
+                        recv_res = notifications.recv() => match recv_res {
+                            Ok((channel, payload)) => {
+                                if uri_match
+                                    .as_ref()
+                                    .is_some_and(|m| !m.matches(&payload, &uri_owned))
+                                {
+                                    continue;
                                 }
-                                Err(e) => {
-                                    // PgListener reconnects transparently; a
-                                    // `recv` error usually means the pool is
-                                    // closing. Log and let the outer cancel
-                                    // path handle teardown.
-                                    warn!(
-                                        uri = %uri_owned,
-                                        channel = %channel_owned,
-                                        error = %e,
-                                        "postgres_listen_notify: recv error; \
-                                         awaiting cancel"
-                                    );
-                                    cancel_child.cancelled().await;
-                                    return;
-                                }
+                                sink.emit(event_from_payload(&channel, &payload, event_source))
+                                    .await;
+                            }
+                            // Missed notifications may have named this URI.
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                                warn!(
+                                    uri = %uri_owned,
+                                    channel = %channel_owned,
+                                    missed,
+                                    "postgres_listen_notify: watch lagged; reporting a change"
+                                );
+                                sink.emit(event_from_payload(&channel_owned, "", event_source))
+                                    .await;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                cancel_child.cancelled().await;
+                                return;
                             }
                         }
                     }
@@ -321,6 +465,45 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(s.channel, "orders_changed");
+    }
+
+    fn instruction_match() -> UriMatch {
+        UriMatch {
+            payload_field: "i".into(),
+            uris: vec!["imd://instructions/{value}".into()],
+        }
+    }
+
+    #[test]
+    fn uri_match_names_only_the_uri_of_the_payload_value() {
+        let m = instruction_match();
+        let payload = r#"{"i": "abc", "t": "ref"}"#;
+        assert!(m.matches(payload, "imd://instructions/abc"));
+        assert!(!m.matches(payload, "imd://instructions/xyz"));
+        assert!(
+            !m.matches(payload, "imd://instructions/abc@ver_1"),
+            "a pinned version is not the moving ref"
+        );
+    }
+
+    #[test]
+    fn uri_match_takes_a_number_and_ignores_a_payload_without_the_field() {
+        let m = instruction_match();
+        assert!(m.matches(r#"{"i": 42}"#, "imd://instructions/42"));
+        assert!(!m.matches(r#"{"t": "ref"}"#, "imd://instructions/42"));
+        assert!(!m.matches("not json", "imd://instructions/42"));
+    }
+
+    #[test]
+    fn validate_rejects_a_uri_match_pattern_without_the_value() {
+        let s: PostgresListenNotifyWatchSpec = serde_json::from_value(json!({
+            "url": "postgres://app@localhost/db",
+            "channel": "imd_refs",
+            "uri_match": { "payload_field": "i", "uris": ["imd://instructions/all"] }
+        }))
+        .unwrap();
+        let err = s.validate().unwrap_err();
+        assert!(matches!(err, SqlError::InvalidSpec(m) if m.contains("{value}")));
     }
 
     #[test]
