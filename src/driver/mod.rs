@@ -51,6 +51,9 @@ pub mod mysql;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
+#[cfg(feature = "sqlite")]
+pub mod sqlite_ext;
+
 /// Connection config derived from a validated [`SqlBackendConfig`].
 ///
 /// Carries the pool knobs and the connection URL. The URL embeds any
@@ -86,6 +89,9 @@ pub struct ConnectCfg {
     /// the token on schedule. `None` keeps the legacy
     /// "URL holds the password" path.
     pub auth_provider: Option<Arc<dyn crate::auth::AuthProvider>>,
+    /// SQLite run-time loadable extensions, in load order. Empty for
+    /// every other driver.
+    pub sqlite_extensions: Vec<crate::config::SqliteExtension>,
 }
 
 impl std::fmt::Debug for ConnectCfg {
@@ -103,6 +109,7 @@ impl std::fmt::Debug for ConnectCfg {
                 "auth_provider",
                 &self.auth_provider.as_ref().map(|p| p.scheme()),
             )
+            .field("sqlite_extensions", &self.sqlite_extensions)
             .finish()
     }
 }
@@ -123,6 +130,11 @@ impl ConnectCfg {
             test_before_acquire: cfg.pool.test_before_acquire,
             statement_timeout_ms: cfg.query.timeout_ms,
             auth_provider: None,
+            sqlite_extensions: cfg
+                .sqlite
+                .as_ref()
+                .map(|s| s.extensions.clone())
+                .unwrap_or_default(),
         }
     }
 

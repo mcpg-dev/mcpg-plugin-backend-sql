@@ -92,6 +92,119 @@ connection); SQLite ignores them.
 Each driver is gated behind a Cargo feature of the same name. The
 default build enables all three.
 
+## SQLite extensions
+
+SQLite runs inside the gateway process; the plugin compiles it in, so
+the host needs no `libsqlite3`. The compiled-in SQLite already has
+FTS3, FTS4 and FTS5, JSON1, R-Tree, DBSTAT, STAT4 and SOUNDEX — no
+extension is needed for those.
+
+A SQLite binding can also load run-time loadable extensions
+(`sqlite-vec`, SpatiaLite, and others). An extension is native code that
+runs in the gateway process with the gateway's privileges, so the
+binding config alone cannot load one: whoever starts the gateway must
+also approve the directory it comes from.
+
+### Turn it on
+
+Set `MCPG_SQLITE_EXTENSION_DIRS` in the gateway's environment to the
+directories that hold approved extensions, separated like `PATH`
+(`:` on Linux and macOS). Every entry must be an absolute path. Unset or
+empty, loading is off, and a binding that lists an extension fails to
+register. The variable is read once, when the plugin loads.
+
+The variable belongs to the deployment, never to the gateway config:
+
+- Docker: `-e MCPG_SQLITE_EXTENSION_DIRS=/opt/sqlite-ext`, with the
+  directory mounted read-only.
+- Helm (`mcpg` chart): `extraEnv` for the variable, `extraVolumes` and
+  `extraVolumeMounts` (`readOnly: true`) for the directory.
+- systemd: `Environment=MCPG_SQLITE_EXTENSION_DIRS=/opt/sqlite-ext`.
+
+The public gateway images contain no extensions. Mount them, or build an
+image of your own on top.
+
+### Configure a binding
+
+```yaml
+backend:
+  kind: sql
+  driver: sqlite
+  url: "sqlite:/data/app.db?mode=rwc"
+  sqlite:
+    extensions:
+      - path: /opt/sqlite-ext/vec0.so
+        sha256: 5f1c…  # sha256sum /opt/sqlite-ext/vec0.so
+      - path: /opt/sqlite-ext/mod_spatialite.so
+        sha256: 9be2…
+        entrypoint: sqlite3_modspatialite_init
+  query:
+    sql: "SELECT vec_version() AS version"
+    row_mode: single
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `path` | yes | Absolute path of the shared library, with its file extension. No `..`. |
+| `sha256` | yes | SHA-256 of the file, 64 hex digits (either case). |
+| `entrypoint` | no | Entry-point symbol, a C identifier. Absent: SQLite tries `sqlite3_extension_init`, then `sqlite3_<name>_init`, where `<name>` is the file name's letters, lower-cased, after any `lib` prefix and before the first `.` (`vec0.so` → `sqlite3_vec_init`). |
+
+A binding lists at most 16 extensions, each file once. Config
+validation refuses the `sqlite:` block on any driver other than
+`sqlite`.
+
+### What the plugin checks
+
+When the binding registers, and again before each new pool connection
+loads the files, every extension must pass all of these:
+
+1. Its canonical path (symbolic links resolved) is inside a canonical
+   approved directory. A link that leads out of the directory is refused.
+2. It is a regular file of at most 256 MiB.
+3. The file and every directory above it, up to `/`, are owned by root
+   or by the gateway's user. None is writable by group or others, except
+   a directory with the sticky bit (such as `/tmp`).
+4. Its SHA-256 equals `sha256`. A new connection hashes the file again
+   only when its device, inode, size, mtime or ctime changed.
+
+At registration the plugin then loads the extensions into one trial
+connection, so a file SQLite cannot load, or a missing entry point,
+fails registration with SQLite's own reason.
+
+### How the load works
+
+Each new pool connection loads the extensions in the order listed. The
+plugin turns on SQLite's C loading interface for the load only, and
+turns it off again before the connection serves a query. The SQL
+function `load_extension()` stays off on every connection, so a query
+cannot load a library: it fails with `not authorized`.
+
+If a file fails a check after registration, a new connection is
+refused. The caller sees only a pool timeout, which does not disclose
+server paths. The gateway log has the reason, at `warn` level on target
+`mcpg::sql::sqlite_ext`.
+
+### Replace an extension
+
+1. Put the new file in an approved directory under a new name, or
+   rename it over the old one. **Do not write into a loaded file**: the
+   gateway has it mapped as code, and changing it in place can crash the
+   gateway.
+2. Change `sha256` (and `path`, if the name changed).
+3. Restart the gateway. A process keeps a library it has loaded, so a
+   new file at the same path can go on running the old code until a
+   restart.
+
+### Limits
+
+- Linux and macOS only. On Windows every load is refused.
+- The file must match the gateway's OS, CPU and C library: a glibc
+  gateway needs a glibc build, the musl image a musl build.
+- The checks run before the load. Whoever can write the file as its
+  owner can still swap it between the check and the load, so keep the
+  files and their directories owned by root and read-only to the
+  gateway's user.
+
 ## Credentials
 
 The connection URL is the **sole credential surface**. Operators embed

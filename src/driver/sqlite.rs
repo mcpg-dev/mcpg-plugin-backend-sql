@@ -35,6 +35,7 @@ use serde_json::{Map, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{Column, Row};
 
+use crate::driver::sqlite_ext::{self, ExtensionPolicy};
 use crate::driver::{ConnectCfg, ConnectOutcome, PoolHandle, RowBatch, SqlDriver};
 use crate::errors::SqlError;
 use crate::in_flight::BackendId;
@@ -54,6 +55,8 @@ pub struct SqliteDriver {
     /// Monotonically increasing handle id source. Wraps; collisions
     /// over `u64` are not a real risk.
     next_handle: AtomicU64,
+    /// Where run-time loadable extensions may load from.
+    extension_policy: ExtensionPolicy,
 }
 
 /// One query's cancel state, read by the progress handler on its
@@ -96,11 +99,24 @@ impl Default for SqliteDriver {
 }
 
 impl SqliteDriver {
-    /// Construct an empty SQLite driver with a fresh handle table.
+    /// Construct an empty SQLite driver with a fresh handle table. The
+    /// approved extension directories come from the process environment
+    /// ([`EXTENSION_DIRS_ENV`](crate::driver::sqlite_ext::EXTENSION_DIRS_ENV)).
     pub fn new() -> Self {
+        Self::with_extension_policy(ExtensionPolicy::from_env())
+    }
+
+    /// Construct a driver whose approved extension directories are
+    /// `dirs` instead of the environment's.
+    pub fn with_extension_dirs(dirs: Vec<std::path::PathBuf>) -> Self {
+        Self::with_extension_policy(ExtensionPolicy::from_dirs(dirs))
+    }
+
+    fn with_extension_policy(extension_policy: ExtensionPolicy) -> Self {
         Self {
             handles: Arc::new(DashMap::new()),
             next_handle: AtomicU64::new(1),
+            extension_policy,
         }
     }
 
@@ -157,13 +173,38 @@ impl SqlDriver for SqliteDriver {
             .map_err(|e| SqlError::InvalidSpec(format!("sqlite url: {e}")))?
             .create_if_missing(true);
 
-        let pool = SqlitePoolOptions::new()
+        let mut pool_opts = SqlitePoolOptions::new()
             .max_connections(cfg.max_connections)
             .min_connections(cfg.min_idle)
             .acquire_timeout(Duration::from_millis(cfg.acquire_timeout_ms))
             .idle_timeout(Some(Duration::from_millis(cfg.idle_timeout_ms)))
             .max_lifetime(Some(Duration::from_millis(cfg.max_lifetime_ms)))
-            .test_before_acquire(cfg.test_before_acquire)
+            .test_before_acquire(cfg.test_before_acquire);
+
+        if !cfg.sqlite_extensions.is_empty() {
+            let policy = self.extension_policy.clone();
+            let wanted = cfg.sqlite_extensions.clone();
+            let approved =
+                tokio::task::spawn_blocking(move || sqlite_ext::approve_all(&policy, &wanted))
+                    .await
+                    .map_err(|e| {
+                        SqlError::InvalidSpec(format!("sqlite extension check did not finish: {e}"))
+                    })??;
+            let approved = Arc::new(approved);
+            // One trial load before the pool opens, so a library SQLite
+            // cannot load fails registration with SQLite's own reason.
+            let mut trial = sqlx::ConnectOptions::connect(&opts)
+                .await
+                .map_err(SqlError::Connect)?;
+            let loaded = sqlite_ext::load_into_connection(&mut trial, Arc::clone(&approved)).await;
+            let _ = sqlx::Connection::close(trial).await;
+            loaded.map_err(SqlError::InvalidSpec)?;
+            pool_opts = pool_opts.after_connect(move |conn, _meta| {
+                Box::pin(sqlite_ext::after_connect(conn, Arc::clone(&approved)))
+            });
+        }
+
+        let pool = pool_opts
             .connect_with(opts)
             .await
             .map_err(SqlError::Connect)?;
@@ -492,6 +533,7 @@ mod tests {
             test_before_acquire: false,
             statement_timeout_ms: None,
             auth_provider: None,
+            sqlite_extensions: Vec::new(),
         };
         let outcome = driver.connect(&cfg).await.expect("connect");
         (driver, outcome.pool)

@@ -184,6 +184,120 @@ pub struct SqlBackendConfig {
     /// is inert — not a credential surface — so it does not conflict.)
     #[serde(default)]
     pub auth: Option<crate::auth::AuthConfig>,
+    /// SQLite-only options. Validation refuses the block on any other
+    /// driver.
+    #[serde(default)]
+    pub sqlite: Option<SqliteOptions>,
+}
+
+/// Most extensions one binding may load.
+pub const MAX_SQLITE_EXTENSIONS: usize = 16;
+
+/// Longest accepted extension entry-point name.
+const MAX_ENTRYPOINT_LEN: usize = 128;
+
+/// Options that apply only to `driver: sqlite`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SqliteOptions {
+    /// Run-time loadable extensions, loaded in this order into every
+    /// connection of the binding's pool. A load runs native code in the
+    /// gateway process, so each file must sit in a directory that the
+    /// gateway's environment approves (`MCPG_SQLITE_EXTENSION_DIRS`) and
+    /// must match its pinned SHA-256; see `driver::sqlite_ext`.
+    #[serde(default)]
+    pub extensions: Vec<SqliteExtension>,
+}
+
+/// One run-time loadable SQLite extension.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SqliteExtension {
+    /// Absolute path of the shared library, with its file extension
+    /// (`.so`, `.dylib`).
+    pub path: PathBuf,
+    /// SHA-256 of the file, 64 hex digits.
+    pub sha256: String,
+    /// Entry-point symbol. Absent: SQLite tries `sqlite3_extension_init`,
+    /// then `sqlite3_<name>_init` derived from the file name.
+    #[serde(default)]
+    pub entrypoint: Option<String>,
+}
+
+impl SqliteOptions {
+    /// Shape checks that need no file system access. The checks that
+    /// read the file and the environment run when the pool opens.
+    pub fn validate(&self) -> Result<(), SqlError> {
+        if self.extensions.len() > MAX_SQLITE_EXTENSIONS {
+            return Err(SqlError::InvalidSpec(format!(
+                "sqlite.extensions lists {} extensions; at most {MAX_SQLITE_EXTENSIONS} are allowed",
+                self.extensions.len()
+            )));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for (i, ext) in self.extensions.iter().enumerate() {
+            ext.validate()
+                .map_err(|why| SqlError::InvalidSpec(format!("sqlite.extensions[{i}]: {why}")))?;
+            if !seen.insert(&ext.path) {
+                return Err(SqlError::InvalidSpec(format!(
+                    "sqlite.extensions[{i}]: '{}' is listed more than once",
+                    ext.path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl SqliteExtension {
+    fn validate(&self) -> Result<(), String> {
+        let text = self.path.to_str().unwrap_or_default();
+        if text.is_empty() {
+            return Err("path is empty".into());
+        }
+        if text.contains('\0') {
+            return Err("path contains a NUL byte".into());
+        }
+        if !self.path.is_absolute() {
+            return Err(format!("path '{text}' is not absolute"));
+        }
+        if self
+            .path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!("path '{text}' contains '..'"));
+        }
+        if self.sha256.len() != 64 || !self.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("sha256 must be 64 hex digits".into());
+        }
+        if let Some(entry) = &self.entrypoint {
+            let mut bytes = entry.bytes();
+            let valid = entry.len() <= MAX_ENTRYPOINT_LEN
+                && bytes
+                    .next()
+                    .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+                && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_');
+            if !valid {
+                return Err(format!(
+                    "entrypoint '{entry}' is not a C identifier of at most {MAX_ENTRYPOINT_LEN} characters"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The pinned digest as bytes. Call only after [`SqliteOptions::validate`].
+    pub fn sha256_bytes(&self) -> Result<[u8; 32], SqlError> {
+        let mut out = [0u8; 32];
+        hex::decode_to_slice(&self.sha256, &mut out).map_err(|e| {
+            SqlError::InvalidSpec(format!(
+                "sqlite extension '{}': sha256: {e}",
+                self.path.display()
+            ))
+        })?;
+        Ok(out)
+    }
 }
 
 /// Per-binding response-cache opt-in.
@@ -910,6 +1024,16 @@ impl SqlBackendConfig {
             }
         }
 
+        if let Some(sqlite) = &self.sqlite {
+            if self.driver != DriverKind::Sqlite {
+                return Err(SqlError::InvalidSpec(format!(
+                    "the `sqlite:` block applies only to driver: sqlite, not driver: {}",
+                    self.driver.as_str()
+                )));
+            }
+            sqlite.validate()?;
+        }
+
         if self.pool.max_connections == 0 {
             return Err(SqlError::InvalidSpec(
                 "pool.max_connections must be > 0".into(),
@@ -1402,6 +1526,7 @@ mod tests {
             cache: None,
             cost: None,
             auth: None,
+            sqlite: None,
         }
     }
 
@@ -1968,6 +2093,127 @@ mod tests {
         c.isolation_level = Some(IsolationLevel::RepeatableRead);
         let err = c.validate().unwrap_err();
         assert!(matches!(err, SqlError::InvalidSpec(_)));
+    }
+
+    fn with_extensions(extensions: Vec<SqliteExtension>) -> SqlBackendConfig {
+        let mut c = minimal("sqlite::memory:", DriverKind::Sqlite);
+        c.sqlite = Some(SqliteOptions { extensions });
+        c
+    }
+
+    fn extension(path: &str) -> SqliteExtension {
+        SqliteExtension {
+            path: PathBuf::from(path),
+            sha256: "a1".repeat(32),
+            entrypoint: None,
+        }
+    }
+
+    fn extension_error(c: &SqlBackendConfig) -> String {
+        match c.validate() {
+            Err(SqlError::InvalidSpec(m)) => m,
+            other => panic!("expected InvalidSpec, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_sqlite_extensions() {
+        let mut named = extension("/opt/ext/vec0.so");
+        named.entrypoint = Some("sqlite3_vec_init".into());
+        named.sha256 = "A1".repeat(32);
+        with_extensions(vec![extension("/opt/ext/a.so"), named])
+            .validate()
+            .expect("two well-formed extensions");
+        with_extensions(vec![]).validate().expect("an empty list");
+    }
+
+    #[test]
+    fn validate_rejects_the_sqlite_block_on_other_drivers() {
+        for (driver, url) in [
+            (DriverKind::Postgres, "postgres://u@h/db"),
+            (DriverKind::Mysql, "mysql://u@h/db"),
+        ] {
+            let mut c = minimal(url, driver);
+            c.sqlite = Some(SqliteOptions::default());
+            assert!(extension_error(&c).contains("applies only to driver: sqlite"));
+        }
+    }
+
+    #[test]
+    fn validate_rejects_malformed_sqlite_extensions() {
+        let cases: Vec<(SqliteExtension, &str)> = vec![
+            (extension(""), "path is empty"),
+            (extension("ext/vec0.so"), "is not absolute"),
+            (extension("/opt/ext/../../etc/x.so"), "contains '..'"),
+            (extension("/opt/ext/\0.so"), "NUL"),
+            (
+                SqliteExtension {
+                    sha256: "a1".repeat(31),
+                    ..extension("/opt/ext/a.so")
+                },
+                "64 hex digits",
+            ),
+            (
+                SqliteExtension {
+                    sha256: "zz".repeat(32),
+                    ..extension("/opt/ext/a.so")
+                },
+                "64 hex digits",
+            ),
+            (
+                SqliteExtension {
+                    entrypoint: Some("init; DROP".into()),
+                    ..extension("/opt/ext/a.so")
+                },
+                "not a C identifier",
+            ),
+            (
+                SqliteExtension {
+                    entrypoint: Some("1init".into()),
+                    ..extension("/opt/ext/a.so")
+                },
+                "not a C identifier",
+            ),
+            (
+                SqliteExtension {
+                    entrypoint: Some("x".repeat(129)),
+                    ..extension("/opt/ext/a.so")
+                },
+                "not a C identifier",
+            ),
+        ];
+        for (ext, want) in cases {
+            let err = extension_error(&with_extensions(vec![ext.clone()]));
+            assert!(
+                err.contains("sqlite.extensions[0]") && err.contains(want),
+                "{ext:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_repeated_or_excess_sqlite_extension() {
+        let twice = with_extensions(vec![extension("/opt/ext/a.so"), extension("/opt/ext/a.so")]);
+        assert!(extension_error(&twice).contains("listed more than once"));
+
+        let many = (0..=MAX_SQLITE_EXTENSIONS)
+            .map(|i| extension(&format!("/opt/ext/{i}.so")))
+            .collect();
+        assert!(extension_error(&with_extensions(many)).contains("at most 16"));
+    }
+
+    #[test]
+    fn sqlite_extension_fields_are_strict() {
+        let err = serde_json::from_value::<SqliteOptions>(serde_json::json!({
+            "extensions": [{ "path": "/opt/ext/a.so", "sha256": "a1", "sha": "x" }]
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `sha`"), "{err}");
+        let err = serde_json::from_value::<SqliteOptions>(serde_json::json!({
+            "extensions": [{ "path": "/opt/ext/a.so" }]
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("missing field `sha256`"), "{err}");
     }
 
     #[test]
