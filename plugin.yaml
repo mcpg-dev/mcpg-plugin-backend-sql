@@ -18,6 +18,10 @@ protocol_version: "1.0"
 required_capabilities: [network_outbound]
 # MCP Events: how each watch runs as a source, and what it emits.
 watch_strategies:
+  # No payload: a changed tracking query says only that the resource changed.
+  - kind: sql_polling
+    placement: single_owner
+    resume: false
   - kind: postgres_listen_notify
     placement: single_owner
     resume: false

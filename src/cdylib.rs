@@ -454,5 +454,20 @@ mod tests {
                 "`{kind}` emits sql.row.changed"
             );
         }
+        // The host warns at each boot about a registered strategy the
+        // descriptor leaves out.
+        for kind in [
+            "sql_polling",
+            "postgres_listen_notify",
+            "sql_changes",
+            crate::watch_pg_cdc::WATCH_KIND,
+        ] {
+            assert!(
+                descriptor.watch_strategy(kind).is_some(),
+                "`{kind}` is declared"
+            );
+        }
+        let polling = descriptor.watch_strategy("sql_polling").unwrap();
+        assert!(polling.event_types.is_empty(), "sql_polling has no payload");
     }
 }
