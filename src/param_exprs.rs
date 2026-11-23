@@ -407,6 +407,7 @@ mod tests {
         .unwrap();
         let client = mcpg_plugin_protocol::ClientInfo {
             name: "claude-code".into(),
+            title: None,
             version: Some("2.1".into()),
         };
         let mut args = serde_json::json!({"via": "spoofed"});
