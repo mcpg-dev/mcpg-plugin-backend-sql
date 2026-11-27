@@ -6,6 +6,7 @@
 //! provides, with a fallback for non-JSON columns that go through
 //! the `sqlx` column-by-column decode helpers.
 
+use std::borrow::Cow;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -175,10 +176,8 @@ impl SqlDriver for PostgresDriver {
         // Fast path: no session_vars → direct execute against pool,
         // one round trip.
         if session.is_empty() {
-            let mut q = sqlx::query(&stmt.sql);
-            for arg in args {
-                q = bind_pg(q, &arg.value);
-            }
+            let sql = pg_statement_sql(&stmt.sql, args);
+            let q = query_pg(&sql, args);
             let rows = q.fetch_all(pool).await.map_err(SqlError::from_execute)?;
             let columns = rows
                 .first()
@@ -218,10 +217,8 @@ impl SqlDriver for PostgresDriver {
                 .map_err(SqlError::from_execute)?;
         }
 
-        let mut q = sqlx::query(&stmt.sql);
-        for arg in args {
-            q = bind_pg(q, &arg.value);
-        }
+        let sql = pg_statement_sql(&stmt.sql, args);
+        let q = query_pg(&sql, args);
         let rows = q
             .fetch_all(&mut *tx)
             .await
@@ -265,10 +262,8 @@ impl SqlDriver for PostgresDriver {
         };
 
         if session.is_empty() {
-            let mut q = sqlx::query(&stmt.sql);
-            for arg in args {
-                q = bind_pg(q, &arg.value);
-            }
+            let sql = pg_statement_sql(&stmt.sql, args);
+            let q = query_pg(&sql, args);
             let result = q.execute(pool).await.map_err(SqlError::from_execute)?;
             return Ok(result.rows_affected());
         }
@@ -288,10 +283,8 @@ impl SqlDriver for PostgresDriver {
                 .await
                 .map_err(SqlError::from_execute)?;
         }
-        let mut q = sqlx::query(&stmt.sql);
-        for arg in args {
-            q = bind_pg(q, &arg.value);
-        }
+        let sql = pg_statement_sql(&stmt.sql, args);
+        let q = query_pg(&sql, args);
         let result = q.execute(&mut *tx).await.map_err(SqlError::from_execute)?;
         tx.commit().await.map_err(SqlError::from_execute)?;
         Ok(result.rows_affected())
@@ -351,10 +344,8 @@ impl SqlDriver for PostgresDriver {
                     .await
                     .map_err(SqlError::from_execute)?;
             }
-            let mut q = sqlx::query(&stmt.sql);
-            for arg in args {
-                q = bind_pg(q, &arg.value);
-            }
+            let sql = pg_statement_sql(&stmt.sql, args);
+            let q = query_pg(&sql, args);
             let rows = q
                 .fetch_all(&mut *tx)
                 .await
@@ -378,10 +369,8 @@ impl SqlDriver for PostgresDriver {
         }
 
         // Fast path: no session_vars.
-        let mut q = sqlx::query(&stmt.sql);
-        for arg in args {
-            q = bind_pg(q, &arg.value);
-        }
+        let sql = pg_statement_sql(&stmt.sql, args);
+        let q = query_pg(&sql, args);
         let rows = q
             .fetch_all(&mut *conn)
             .await
@@ -438,18 +427,14 @@ impl SqlDriver for PostgresDriver {
                     .await
                     .map_err(SqlError::from_execute)?;
             }
-            let mut q = sqlx::query(&stmt.sql);
-            for arg in args {
-                q = bind_pg(q, &arg.value);
-            }
+            let sql = pg_statement_sql(&stmt.sql, args);
+            let q = query_pg(&sql, args);
             let result = q.execute(&mut *tx).await.map_err(SqlError::from_execute)?;
             tx.commit().await.map_err(SqlError::from_execute)?;
             return Ok(result.rows_affected());
         }
-        let mut q = sqlx::query(&stmt.sql);
-        for arg in args {
-            q = bind_pg(q, &arg.value);
-        }
+        let sql = pg_statement_sql(&stmt.sql, args);
+        let q = query_pg(&sql, args);
         let result = q
             .execute(&mut *conn)
             .await
@@ -588,7 +573,7 @@ impl SqlDriver for PostgresDriver {
 /// The coercion table is good enough for
 /// common types; richer coverage (UUID format hints, base64 bytea) is
 /// follow-on work. Unknown shapes fall back to a JSONB bind.
-pub(crate) fn bind_pg<'q>(
+fn bind_pg<'q>(
     q: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
     v: &'q Value,
 ) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
@@ -611,6 +596,50 @@ pub(crate) fn bind_pg<'q>(
         // jsonb columns without bespoke handling.
         Value::Array(_) | Value::Object(_) => q.bind(v.clone()),
     }
+}
+
+/// One letter for the Postgres type [`bind_pg`] sends for `v`; the
+/// branches match `bind_pg` one for one.
+fn pg_type_code(v: &Value) -> char {
+    match v {
+        Value::Null => 'n',
+        Value::Bool(_) => 'b',
+        Value::Number(n) if n.as_i64().is_some() => 'i',
+        Value::Number(n) if n.as_f64().is_some() => 'f',
+        Value::Number(_) | Value::String(_) => 't',
+        Value::Array(_) | Value::Object(_) => 'j',
+    }
+}
+
+/// The SQL text to prepare for `sql` bound to `args`.
+///
+/// sqlx caches prepared statements per connection by SQL text alone, and
+/// a cached statement keeps the parameter types of the call that prepared
+/// it, so a later call that binds other types has its values read as the
+/// old ones. The trailing comment names the bound types, which gives each
+/// type signature its own cached statement.
+pub(crate) fn pg_statement_sql<'a>(sql: &'a str, args: &[BoundParam]) -> Cow<'a, str> {
+    if args.is_empty() {
+        return Cow::Borrowed(sql);
+    }
+    let mut out = String::with_capacity(sql.len() + 20 + args.len());
+    out.push_str(sql);
+    out.push_str("\n/* mcpg:args=");
+    out.extend(args.iter().map(|a| pg_type_code(&a.value)));
+    out.push_str(" */");
+    Cow::Owned(out)
+}
+
+/// A query over `sql` (from [`pg_statement_sql`]) with every argument bound.
+pub(crate) fn query_pg<'q>(
+    sql: &'q str,
+    args: &'q [BoundParam],
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    let mut q = sqlx::query(sql);
+    for arg in args {
+        q = bind_pg(q, &arg.value);
+    }
+    q
 }
 
 /// Decode a Postgres row into a JSON object keyed by column name.
@@ -816,4 +845,64 @@ fn pg_host_from_url(url: &str) -> Option<String> {
 /// this returns `None`.
 fn pg_port_from_url(url: &str) -> Option<u16> {
     url::Url::parse(url).ok()?.port()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn args(values: &[Value]) -> Vec<BoundParam> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| BoundParam {
+                name: format!("p{i}"),
+                value: v.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn statement_sql_without_args_is_the_sql() {
+        assert!(matches!(
+            pg_statement_sql("SELECT 1", &[]),
+            Cow::Borrowed("SELECT 1")
+        ));
+    }
+
+    #[test]
+    fn statement_sql_names_each_bound_type() {
+        let a = args(&[
+            Value::Null,
+            json!(true),
+            json!(7),
+            json!(1.5),
+            json!(u64::MAX),
+            json!("s"),
+            json!([1]),
+            json!({"k": 1}),
+        ]);
+        assert_eq!(
+            pg_statement_sql("SELECT $1", &a),
+            "SELECT $1\n/* mcpg:args=nbifftjj */"
+        );
+    }
+
+    #[test]
+    fn statement_sql_differs_when_a_type_differs() {
+        let sql = "SELECT CAST($1 AS jsonb)";
+        assert_ne!(
+            pg_statement_sql(sql, &args(&[Value::Null])),
+            pg_statement_sql(sql, &args(&[json!(["a"])]))
+        );
+        assert_ne!(
+            pg_statement_sql(sql, &args(&[json!(3)])),
+            pg_statement_sql(sql, &args(&[json!(3.5)]))
+        );
+        assert_eq!(
+            pg_statement_sql(sql, &args(&[json!(["a"])])),
+            pg_statement_sql(sql, &args(&[json!({"b": 2})]))
+        );
+    }
 }

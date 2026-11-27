@@ -101,7 +101,7 @@ pub trait SqlTxHandle: Send + Sync {
 #[cfg(feature = "postgres")]
 pub(crate) mod postgres {
     use super::*;
-    use crate::driver::postgres::{bind_pg, row_to_json_pg};
+    use crate::driver::postgres::{pg_statement_sql, query_pg, row_to_json_pg};
     use sqlx::{Column, Row};
 
     /// Owned Postgres transaction. `state = None` once commit /
@@ -173,10 +173,8 @@ pub(crate) mod postgres {
                     return Err(SqlError::from_execute(e));
                 }
             }
-            let mut q = sqlx::query(&stmt.sql);
-            for arg in args {
-                q = bind_pg(q, &arg.value);
-            }
+            let sql = pg_statement_sql(&stmt.sql, args);
+            let q = query_pg(&sql, args);
             let rows_res = q.fetch_all(&mut *tx).await;
             let rows = match rows_res {
                 Ok(r) => r,
@@ -221,10 +219,8 @@ pub(crate) mod postgres {
                     return Err(SqlError::from_execute(e));
                 }
             }
-            let mut q = sqlx::query(&stmt.sql);
-            for arg in args {
-                q = bind_pg(q, &arg.value);
-            }
+            let sql = pg_statement_sql(&stmt.sql, args);
+            let q = query_pg(&sql, args);
             let result_res = q.execute(&mut *tx).await;
             match result_res {
                 Ok(result) => {
